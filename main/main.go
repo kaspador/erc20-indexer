@@ -16,6 +16,8 @@ import (
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 )
 
@@ -25,6 +27,8 @@ type Indexer struct {
 	stopChan chan struct{}
 	wg       sync.WaitGroup
 }
+
+var approvalEventSignature = crypto.Keccak256Hash([]byte("Approval(address,address,uint256)"))
 
 func main() {
 	config.Load()
@@ -234,7 +238,98 @@ func (i *Indexer) processBlock(ethClient *ethclient.Client, blockNumber uint64) 
 		}
 	}
 
+	if err := i.processApprovalEvents(ethClient, blockNumber, block.Hash().Hex()); err != nil {
+		log.Printf("Error processing approval events for block %d: %v", blockNumber, err)
+	}
+
 	return nil
+}
+
+func (i *Indexer) processApprovalEvents(ethClient *ethclient.Client, blockNumber uint64, blockHash string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	query := ethereum.FilterQuery{
+		FromBlock: big.NewInt(int64(blockNumber)),
+		ToBlock:   big.NewInt(int64(blockNumber)),
+		Topics: [][]common.Hash{
+			{approvalEventSignature},
+		},
+	}
+
+	logs, err := ethClient.FilterLogs(ctx, query)
+	if err != nil {
+		return fmt.Errorf("failed to filter logs for block %d: %w", blockNumber, err)
+	}
+
+	approvalCount := 0
+	for _, vLog := range logs {
+		if len(vLog.Topics) >= 3 {
+			approval, err := i.parseApprovalEvent(vLog, blockNumber, blockHash)
+			if err != nil {
+				log.Printf("Error parsing approval event in tx %s: %v", vLog.TxHash.Hex(), err)
+				continue
+			}
+
+			exists, err := database.TokenExists(approval.TokenAddress)
+			if err != nil {
+				log.Printf("Error checking if token exists %s: %v", approval.TokenAddress, err)
+				continue
+			}
+
+			if !exists {
+				tokenInfo, isERC20 := i.getERC20TokenInfo(ethClient, common.HexToAddress(approval.TokenAddress), blockNumber, blockHash, vLog.TxHash.Hex())
+				if isERC20 {
+					if err := i.addERC20Token(tokenInfo); err != nil {
+						log.Printf("Error adding ERC20 token %s: %v", approval.TokenAddress, err)
+						continue
+					}
+				} else {
+					continue
+				}
+			}
+
+			if err := database.SaveOrUpdateERC20Approval(approval); err != nil {
+				log.Printf("Error saving approval for token %s: %v", approval.TokenAddress, err)
+				continue
+			}
+
+			approvalCount++
+		}
+	}
+
+	if approvalCount > 0 {
+		log.Printf("Processed %d approval events in block %d", approvalCount, blockNumber)
+	}
+
+	return nil
+}
+
+func (i *Indexer) parseApprovalEvent(vLog types.Log, blockNumber uint64, blockHash string) (*database.ERC20Approval, error) {
+	if len(vLog.Topics) < 3 {
+		return nil, fmt.Errorf("insufficient topics for Approval event")
+	}
+
+	if len(vLog.Data) < 32 {
+		return nil, fmt.Errorf("insufficient data for Approval event")
+	}
+
+	owner := common.HexToAddress(vLog.Topics[1].Hex()).Hex()
+	spender := common.HexToAddress(vLog.Topics[2].Hex()).Hex()
+
+	amount := new(big.Int).SetBytes(vLog.Data)
+
+	approval := &database.ERC20Approval{
+		TokenAddress: vLog.Address.Hex(),
+		Owner:        owner,
+		Spender:      spender,
+		Amount:       amount.String(),
+		BlockNumber:  blockNumber,
+		BlockHash:    blockHash,
+		TxHash:       vLog.TxHash.Hex(),
+	}
+
+	return approval, nil
 }
 
 func (i *Indexer) getERC20TokenInfo(ethClient *ethclient.Client, address common.Address, blockNumber uint64, blockHash, txHash string) (*database.ERC20Token, bool) {

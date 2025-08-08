@@ -27,6 +27,19 @@ type ERC20Token struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
+type ERC20Approval struct {
+	ID           int64     `json:"id"`
+	TokenAddress string    `json:"token_address"`
+	Owner        string    `json:"owner"`
+	Spender      string    `json:"spender"`
+	Amount       string    `json:"amount"`
+	BlockNumber  uint64    `json:"block_number"`
+	BlockHash    string    `json:"block_hash"`
+	TxHash       string    `json:"tx_hash"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
 type IndexerState struct {
 	ID                 int       `json:"id"`
 	LastProcessedBlock uint64    `json:"last_processed_block"`
@@ -187,6 +200,33 @@ func createTables() error {
 	blockIndex := `
 	CREATE INDEX IF NOT EXISTS idx_erc20_tokens_block_number ON erc20_tokens(block_number);`
 
+	erc20ApprovalsTable := `
+	CREATE TABLE IF NOT EXISTS erc20_approvals (
+		id BIGSERIAL PRIMARY KEY,
+		token_address VARCHAR(42) NOT NULL,
+		owner VARCHAR(42) NOT NULL,
+		spender VARCHAR(42) NOT NULL,
+		amount VARCHAR(78) NOT NULL, -- Can handle very large numbers as string
+		block_number BIGINT NOT NULL,
+		block_hash VARCHAR(66),
+		tx_hash VARCHAR(66),
+		created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+		updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE(token_address, owner, spender)
+	);`
+
+	approvalsTokenIndex := `
+	CREATE INDEX IF NOT EXISTS idx_erc20_approvals_token_address ON erc20_approvals(token_address);`
+
+	approvalsOwnerIndex := `
+	CREATE INDEX IF NOT EXISTS idx_erc20_approvals_owner ON erc20_approvals(owner);`
+
+	approvalsSpenderIndex := `
+	CREATE INDEX IF NOT EXISTS idx_erc20_approvals_spender ON erc20_approvals(spender);`
+
+	approvalsBlockIndex := `
+	CREATE INDEX IF NOT EXISTS idx_erc20_approvals_block_number ON erc20_approvals(block_number);`
+
 	indexerStateTable := `
 	CREATE TABLE IF NOT EXISTS indexer_state (
 		id SERIAL PRIMARY KEY,
@@ -205,6 +245,26 @@ func createTables() error {
 
 	if _, err := db.Exec(blockIndex); err != nil {
 		return fmt.Errorf("failed to create block_number index: %w", err)
+	}
+
+	if _, err := db.Exec(erc20ApprovalsTable); err != nil {
+		return fmt.Errorf("failed to create erc20_approvals table: %w", err)
+	}
+
+	if _, err := db.Exec(approvalsTokenIndex); err != nil {
+		return fmt.Errorf("failed to create approvals token index: %w", err)
+	}
+
+	if _, err := db.Exec(approvalsOwnerIndex); err != nil {
+		return fmt.Errorf("failed to create approvals owner index: %w", err)
+	}
+
+	if _, err := db.Exec(approvalsSpenderIndex); err != nil {
+		return fmt.Errorf("failed to create approvals spender index: %w", err)
+	}
+
+	if _, err := db.Exec(approvalsBlockIndex); err != nil {
+		return fmt.Errorf("failed to create approvals block index: %w", err)
 	}
 
 	if _, err := db.Exec(indexerStateTable); err != nil {
@@ -271,6 +331,148 @@ func SaveERC20Token(token *ERC20Token) error {
 
 	log.Printf("Saved ERC20 token: %s (%s) at block %d", token.Address, token.Symbol, token.BlockNumber)
 	return nil
+}
+
+func SaveOrUpdateERC20Approval(approval *ERC20Approval) error {
+	query := `
+		INSERT INTO erc20_approvals (token_address, owner, spender, amount, block_number, block_hash, tx_hash)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (token_address, owner, spender) 
+		DO UPDATE SET 
+			amount = EXCLUDED.amount,
+			block_number = EXCLUDED.block_number,
+			block_hash = EXCLUDED.block_hash,
+			tx_hash = EXCLUDED.tx_hash,
+			updated_at = CURRENT_TIMESTAMP
+		RETURNING id, created_at, updated_at
+	`
+
+	err := db.QueryRow(query,
+		approval.TokenAddress,
+		approval.Owner,
+		approval.Spender,
+		approval.Amount,
+		approval.BlockNumber,
+		approval.BlockHash,
+		approval.TxHash,
+	).Scan(&approval.ID, &approval.CreatedAt, &approval.UpdatedAt)
+
+	if err != nil {
+		return fmt.Errorf("failed to save/update ERC20 approval: %w", err)
+	}
+
+	return nil
+}
+
+func GetERC20Approval(tokenAddress, owner, spender string) (*ERC20Approval, error) {
+	approval := &ERC20Approval{}
+
+	query := `
+		SELECT id, token_address, owner, spender, amount, block_number, block_hash, tx_hash, created_at, updated_at
+		FROM erc20_approvals 
+		WHERE token_address = $1 AND owner = $2 AND spender = $3
+	`
+
+	err := db.QueryRow(query, tokenAddress, owner, spender).Scan(
+		&approval.ID,
+		&approval.TokenAddress,
+		&approval.Owner,
+		&approval.Spender,
+		&approval.Amount,
+		&approval.BlockNumber,
+		&approval.BlockHash,
+		&approval.TxHash,
+		&approval.CreatedAt,
+		&approval.UpdatedAt,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to get ERC20 approval: %w", err)
+	}
+
+	return approval, nil
+}
+
+func GetApprovalsByToken(tokenAddress string, offset, limit int) ([]ERC20Approval, error) {
+	query := `
+		SELECT id, token_address, owner, spender, amount, block_number, block_hash, tx_hash, created_at, updated_at
+		FROM erc20_approvals 
+		WHERE token_address = $1 AND amount != '0'
+		ORDER BY updated_at DESC 
+		LIMIT $2 OFFSET $3
+	`
+
+	rows, err := db.Query(query, tokenAddress, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query ERC20 approvals by token: %w", err)
+	}
+	defer rows.Close()
+
+	var approvals []ERC20Approval
+	for rows.Next() {
+		var approval ERC20Approval
+		err := rows.Scan(
+			&approval.ID,
+			&approval.TokenAddress,
+			&approval.Owner,
+			&approval.Spender,
+			&approval.Amount,
+			&approval.BlockNumber,
+			&approval.BlockHash,
+			&approval.TxHash,
+			&approval.CreatedAt,
+			&approval.UpdatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan ERC20 approval: %w", err)
+		}
+		approvals = append(approvals, approval)
+	}
+
+	return approvals, nil
+}
+
+func GetApprovalsByOwner(owner string, offset, limit int) ([]ERC20Approval, error) {
+	query := `
+		SELECT id, token_address, owner, spender, amount, block_number, block_hash, tx_hash, created_at, updated_at
+		FROM erc20_approvals 
+		WHERE owner = $1 AND amount != '0'
+		ORDER BY updated_at DESC 
+		LIMIT $2 OFFSET $3
+	`
+
+	rows, err := db.Query(query, owner, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query ERC20 approvals by owner: %w", err)
+	}
+	defer rows.Close()
+
+	var approvals []ERC20Approval
+	for rows.Next() {
+		var approval ERC20Approval
+		err := rows.Scan(
+			&approval.ID,
+			&approval.TokenAddress,
+			&approval.Owner,
+			&approval.Spender,
+			&approval.Amount,
+			&approval.BlockNumber,
+			&approval.BlockHash,
+			&approval.TxHash,
+			&approval.CreatedAt,
+			&approval.UpdatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan ERC20 approval: %w", err)
+		}
+		approvals = append(approvals, approval)
+	}
+
+	return approvals, nil
 }
 
 func GetERC20TokenByAddress(address string) (*ERC20Token, error) {
