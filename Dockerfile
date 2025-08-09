@@ -4,10 +4,10 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o indexer ./main
+RUN CGO_ENABLED=0 GOOS=linux go build -o out ./main
 
 FROM alpine:latest
 RUN apk --no-cache add ca-certificates
 WORKDIR /root/
-COPY --from=builder /app/indexer .
-CMD ["./indexer"]
+COPY --from=builder /app/out .
+CMD ["./out"]
