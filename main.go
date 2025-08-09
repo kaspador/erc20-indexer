@@ -29,6 +29,8 @@ type Indexer struct {
 }
 
 var approvalEventSignature = crypto.Keccak256Hash([]byte("Approval(address,address,uint256)"))
+var nftApprovalEventSignature = crypto.Keccak256Hash([]byte("Approval(address,address,uint256)"))
+var nftApprovalForAllEventSignature = crypto.Keccak256Hash([]byte("ApprovalForAll(address,address,bool)"))
 
 func main() {
 	config.Load()
@@ -242,6 +244,10 @@ func (i *Indexer) processBlock(ethClient *ethclient.Client, blockNumber uint64) 
 		log.Printf("Error processing approval events for block %d: %v", blockNumber, err)
 	}
 
+	if err := i.processNFTEvents(ethClient, blockNumber, block.Hash().Hex()); err != nil {
+		log.Printf("Error processing NFT events for block %d: %v", blockNumber, err)
+	}
+
 	return nil
 }
 
@@ -435,6 +441,112 @@ func (i *Indexer) monitorNewBlocks() {
 			}
 		}
 	}
+}
+
+func (i *Indexer) processNFTEvents(ethClient *ethclient.Client, blockNumber uint64, blockHash string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Process both NFT Approval and ApprovalForAll events
+	query := ethereum.FilterQuery{
+		FromBlock: big.NewInt(int64(blockNumber)),
+		ToBlock:   big.NewInt(int64(blockNumber)),
+		Topics: [][]common.Hash{
+			{nftApprovalEventSignature, nftApprovalForAllEventSignature},
+		},
+	}
+
+	logs, err := ethClient.FilterLogs(ctx, query)
+	if err != nil {
+		return fmt.Errorf("failed to filter NFT logs for block %d: %w", blockNumber, err)
+	}
+
+	nftEventCount := 0
+	for _, vLog := range logs {
+		if len(vLog.Topics) >= 3 {
+			if vLog.Topics[0] == nftApprovalEventSignature {
+				// Handle individual NFT approval
+				if err := i.processNFTApproval(vLog, blockNumber, blockHash); err != nil {
+					log.Printf("Error processing NFT approval in tx %s: %v", vLog.TxHash.Hex(), err)
+					continue
+				}
+				nftEventCount++
+			} else if vLog.Topics[0] == nftApprovalForAllEventSignature {
+				// Handle operator approval (setApprovalForAll)
+				if err := i.processNFTOperatorApproval(vLog, blockNumber, blockHash); err != nil {
+					log.Printf("Error processing NFT operator approval in tx %s: %v", vLog.TxHash.Hex(), err)
+					continue
+				}
+				nftEventCount++
+			}
+		}
+	}
+
+	if nftEventCount > 0 {
+		log.Printf("Processed %d NFT events in block %d", nftEventCount, blockNumber)
+	}
+
+	return nil
+}
+
+func (i *Indexer) processNFTApproval(vLog types.Log, blockNumber uint64, blockHash string) error {
+	if len(vLog.Topics) < 3 {
+		return fmt.Errorf("insufficient topics for NFT Approval event")
+	}
+
+	if len(vLog.Data) < 32 {
+		return fmt.Errorf("insufficient data for NFT Approval event")
+	}
+
+	owner := common.HexToAddress(vLog.Topics[1].Hex()).Hex()
+	approved := common.HexToAddress(vLog.Topics[2].Hex()).Hex()
+	tokenID := new(big.Int).SetBytes(vLog.Data).String()
+
+	nftApproval := &database.NFTApproval{
+		ContractAddress: vLog.Address.Hex(),
+		Owner:           owner,
+		Approved:        approved,
+		TokenID:         tokenID,
+		BlockNumber:     blockNumber,
+		BlockHash:       blockHash,
+		TxHash:          vLog.TxHash.Hex(),
+	}
+
+	if err := database.SaveOrUpdateNFTApproval(nftApproval); err != nil {
+		return fmt.Errorf("failed to save NFT approval: %w", err)
+	}
+
+	return nil
+}
+
+func (i *Indexer) processNFTOperatorApproval(vLog types.Log, blockNumber uint64, blockHash string) error {
+	if len(vLog.Topics) < 3 {
+		return fmt.Errorf("insufficient topics for NFT ApprovalForAll event")
+	}
+
+	if len(vLog.Data) < 32 {
+		return fmt.Errorf("insufficient data for NFT ApprovalForAll event")
+	}
+
+	owner := common.HexToAddress(vLog.Topics[1].Hex()).Hex()
+	operator := common.HexToAddress(vLog.Topics[2].Hex()).Hex()
+	approved := len(vLog.Data) > 0 && vLog.Data[31] == 1 // Last byte indicates true/false
+
+	operatorApproval := &database.NFTOperatorApproval{
+		ContractAddress: vLog.Address.Hex(),
+		Owner:           owner,
+		Operator:        operator,
+		Approved:        approved,
+		BlockNumber:     blockNumber,
+		BlockHash:       blockHash,
+		TxHash:          vLog.TxHash.Hex(),
+	}
+
+	if err := database.SaveOrUpdateNFTOperatorApproval(operatorApproval); err != nil {
+		return fmt.Errorf("failed to save NFT operator approval: %w", err)
+	}
+
+	return nil
 }
 
 func (i *Indexer) handleShutdown() {

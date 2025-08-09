@@ -40,6 +40,32 @@ type ERC20Approval struct {
 	UpdatedAt    time.Time `json:"updated_at"`
 }
 
+type NFTApproval struct {
+	ID              int64     `json:"id"`
+	ContractAddress string    `json:"contract_address"`
+	Owner           string    `json:"owner"`
+	Approved        string    `json:"approved"`
+	TokenID         string    `json:"token_id"`
+	BlockNumber     uint64    `json:"block_number"`
+	BlockHash       string    `json:"block_hash"`
+	TxHash          string    `json:"tx_hash"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
+}
+
+type NFTOperatorApproval struct {
+	ID              int64     `json:"id"`
+	ContractAddress string    `json:"contract_address"`
+	Owner           string    `json:"owner"`
+	Operator        string    `json:"operator"`
+	Approved        bool      `json:"approved"`
+	BlockNumber     uint64    `json:"block_number"`
+	BlockHash       string    `json:"block_hash"`
+	TxHash          string    `json:"tx_hash"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
+}
+
 type IndexerState struct {
 	ID                 int       `json:"id"`
 	LastProcessedBlock uint64    `json:"last_processed_block"`
@@ -227,6 +253,36 @@ func createTables() error {
 	approvalsBlockIndex := `
 	CREATE INDEX IF NOT EXISTS idx_erc20_approvals_block_number ON erc20_approvals(block_number);`
 
+	nftApprovalsTable := `
+	CREATE TABLE IF NOT EXISTS nft_approvals (
+		id BIGSERIAL PRIMARY KEY,
+		contract_address VARCHAR(42) NOT NULL,
+		owner VARCHAR(42) NOT NULL,
+		approved VARCHAR(42) NOT NULL,
+		token_id VARCHAR(78) NOT NULL, -- Can handle very large token IDs
+		block_number BIGINT NOT NULL,
+		block_hash VARCHAR(66),
+		tx_hash VARCHAR(66),
+		created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+		updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE(contract_address, owner, token_id)
+	);`
+
+	nftOperatorApprovalsTable := `
+	CREATE TABLE IF NOT EXISTS nft_operator_approvals (
+		id BIGSERIAL PRIMARY KEY,
+		contract_address VARCHAR(42) NOT NULL,
+		owner VARCHAR(42) NOT NULL,
+		operator VARCHAR(42) NOT NULL,
+		approved BOOLEAN NOT NULL,
+		block_number BIGINT NOT NULL,
+		block_hash VARCHAR(66),
+		tx_hash VARCHAR(66),
+		created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+		updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE(contract_address, owner, operator)
+	);`
+
 	indexerStateTable := `
 	CREATE TABLE IF NOT EXISTS indexer_state (
 		id SERIAL PRIMARY KEY,
@@ -267,11 +323,35 @@ func createTables() error {
 		return fmt.Errorf("failed to create approvals block index: %w", err)
 	}
 
+	if _, err := db.Exec(nftApprovalsTable); err != nil {
+		return fmt.Errorf("failed to create nft_approvals table: %w", err)
+	}
+
+	if _, err := db.Exec(nftOperatorApprovalsTable); err != nil {
+		return fmt.Errorf("failed to create nft_operator_approvals table: %w", err)
+	}
+
+	// Create NFT indexes
+	nftIndexes := []string{
+		"CREATE INDEX IF NOT EXISTS idx_nft_approvals_owner ON nft_approvals(owner);",
+		"CREATE INDEX IF NOT EXISTS idx_nft_approvals_contract ON nft_approvals(contract_address);",
+		"CREATE INDEX IF NOT EXISTS idx_nft_approvals_block ON nft_approvals(block_number);",
+		"CREATE INDEX IF NOT EXISTS idx_nft_operator_approvals_owner ON nft_operator_approvals(owner);",
+		"CREATE INDEX IF NOT EXISTS idx_nft_operator_approvals_contract ON nft_operator_approvals(contract_address);",
+		"CREATE INDEX IF NOT EXISTS idx_nft_operator_approvals_block ON nft_operator_approvals(block_number);",
+	}
+
+	for _, indexSQL := range nftIndexes {
+		if _, err := db.Exec(indexSQL); err != nil {
+			return fmt.Errorf("failed to create NFT index: %w", err)
+		}
+	}
+
 	if _, err := db.Exec(indexerStateTable); err != nil {
 		return fmt.Errorf("failed to create indexer_state table: %w", err)
 	}
 
-	log.Println("Database tables created/verified successfully")
+	log.Println("Database tables created/verified successfully (including NFT tables)")
 
 	if err := initializeIndexerState(); err != nil {
 		return fmt.Errorf("failed to initialize indexer state: %w", err)
@@ -619,6 +699,147 @@ func Close() error {
 		return db.Close()
 	}
 	return nil
+}
+
+// NFT Approval Functions
+func SaveOrUpdateNFTApproval(approval *NFTApproval) error {
+	query := `
+		INSERT INTO nft_approvals (contract_address, owner, approved, token_id, block_number, block_hash, tx_hash)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (contract_address, owner, token_id) 
+		DO UPDATE SET 
+			approved = EXCLUDED.approved,
+			block_number = EXCLUDED.block_number,
+			block_hash = EXCLUDED.block_hash,
+			tx_hash = EXCLUDED.tx_hash,
+			updated_at = CURRENT_TIMESTAMP
+		RETURNING id, created_at, updated_at
+	`
+
+	err := db.QueryRow(query,
+		approval.ContractAddress,
+		approval.Owner,
+		approval.Approved,
+		approval.TokenID,
+		approval.BlockNumber,
+		approval.BlockHash,
+		approval.TxHash,
+	).Scan(&approval.ID, &approval.CreatedAt, &approval.UpdatedAt)
+
+	if err != nil {
+		return fmt.Errorf("failed to save/update NFT approval: %w", err)
+	}
+
+	return nil
+}
+
+func SaveOrUpdateNFTOperatorApproval(approval *NFTOperatorApproval) error {
+	query := `
+		INSERT INTO nft_operator_approvals (contract_address, owner, operator, approved, block_number, block_hash, tx_hash)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (contract_address, owner, operator) 
+		DO UPDATE SET 
+			approved = EXCLUDED.approved,
+			block_number = EXCLUDED.block_number,
+			block_hash = EXCLUDED.block_hash,
+			tx_hash = EXCLUDED.tx_hash,
+			updated_at = CURRENT_TIMESTAMP
+		RETURNING id, created_at, updated_at
+	`
+
+	err := db.QueryRow(query,
+		approval.ContractAddress,
+		approval.Owner,
+		approval.Operator,
+		approval.Approved,
+		approval.BlockNumber,
+		approval.BlockHash,
+		approval.TxHash,
+	).Scan(&approval.ID, &approval.CreatedAt, &approval.UpdatedAt)
+
+	if err != nil {
+		return fmt.Errorf("failed to save/update NFT operator approval: %w", err)
+	}
+
+	return nil
+}
+
+func GetNFTApprovalsByOwner(owner string, offset, limit int) ([]NFTApproval, error) {
+	query := `
+		SELECT id, contract_address, owner, approved, token_id, block_number, block_hash, tx_hash, created_at, updated_at
+		FROM nft_approvals 
+		WHERE owner = $1 AND approved != '0x0000000000000000000000000000000000000000'
+		ORDER BY updated_at DESC 
+		LIMIT $2 OFFSET $3
+	`
+
+	rows, err := db.Query(query, owner, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query NFT approvals by owner: %w", err)
+	}
+	defer rows.Close()
+
+	var approvals []NFTApproval
+	for rows.Next() {
+		var approval NFTApproval
+		err := rows.Scan(
+			&approval.ID,
+			&approval.ContractAddress,
+			&approval.Owner,
+			&approval.Approved,
+			&approval.TokenID,
+			&approval.BlockNumber,
+			&approval.BlockHash,
+			&approval.TxHash,
+			&approval.CreatedAt,
+			&approval.UpdatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan NFT approval: %w", err)
+		}
+		approvals = append(approvals, approval)
+	}
+
+	return approvals, nil
+}
+
+func GetNFTOperatorApprovalsByOwner(owner string, offset, limit int) ([]NFTOperatorApproval, error) {
+	query := `
+		SELECT id, contract_address, owner, operator, approved, block_number, block_hash, tx_hash, created_at, updated_at
+		FROM nft_operator_approvals 
+		WHERE owner = $1 AND approved = true
+		ORDER BY updated_at DESC 
+		LIMIT $2 OFFSET $3
+	`
+
+	rows, err := db.Query(query, owner, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query NFT operator approvals by owner: %w", err)
+	}
+	defer rows.Close()
+
+	var approvals []NFTOperatorApproval
+	for rows.Next() {
+		var approval NFTOperatorApproval
+		err := rows.Scan(
+			&approval.ID,
+			&approval.ContractAddress,
+			&approval.Owner,
+			&approval.Operator,
+			&approval.Approved,
+			&approval.BlockNumber,
+			&approval.BlockHash,
+			&approval.TxHash,
+			&approval.CreatedAt,
+			&approval.UpdatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan NFT operator approval: %w", err)
+		}
+		approvals = append(approvals, approval)
+	}
+
+	return approvals, nil
 }
 
 func GetDB() *sql.DB {
