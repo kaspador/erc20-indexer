@@ -130,17 +130,58 @@ func (i *Indexer) Start() {
 	log.Println("Indexer stopped")
 }
 
+func (i *Indexer) waitForETHClient() *ethclient.Client {
+	maxRetries := 30 // Max 5 minutes of retries (30 * 10 seconds)
+	retryCount := 0
+
+	for retryCount < maxRetries {
+		select {
+		case <-i.stopChan:
+			log.Println("Stop signal received while waiting for ETH client")
+			return nil
+		default:
+		}
+
+		ethClient := client.GetETHClient()
+		if ethClient != nil {
+			// Test the connection
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_, err := ethClient.BlockNumber(ctx)
+			cancel()
+
+			if err == nil {
+				log.Println("ETH client connection established successfully")
+				return ethClient
+			}
+			log.Printf("ETH client test failed: %v", err)
+		}
+
+		retryCount++
+		log.Printf("Waiting for ETH client connection... (attempt %d/%d)", retryCount, maxRetries)
+		time.Sleep(10 * time.Second)
+	}
+
+	log.Printf("Failed to establish ETH client connection after %d attempts", maxRetries)
+	return nil
+}
+
 func (i *Indexer) indexBlocks() {
 	defer i.wg.Done()
 
-	ethClient := client.GetETHClient()
+	// Wait for ETH client to be available with retry logic
+	ethClient := i.waitForETHClient()
 	if ethClient == nil {
-		log.Fatal("ETH client not available")
+		log.Println("Unable to establish ETH client connection, stopping indexer")
+		return
 	}
 
 	latestBlock, err := ethClient.BlockNumber(context.Background())
 	if err != nil {
-		log.Fatalf("Failed to get latest block number: %v", err)
+		log.Printf("Failed to get latest block number: %v, will retry...", err)
+		// Don't fatal here, let the monitoring loop handle reconnection
+		time.Sleep(10 * time.Second)
+		i.indexBlocks() // Retry the entire function
+		return
 	}
 
 	startBlock := i.state.LastProcessedBlock + 1
@@ -423,14 +464,18 @@ func (i *Indexer) monitorNewBlocks() {
 		case <-ticker.C:
 			ethClient := client.GetETHClient()
 			if ethClient == nil {
-				log.Println("ETH client not available, retrying...")
-				time.Sleep(5 * time.Second)
+				log.Println("ETH client not available during monitoring, waiting for reconnection...")
 				continue
 			}
 
-			latestBlock, err := ethClient.BlockNumber(context.Background())
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			latestBlock, err := ethClient.BlockNumber(ctx)
+			cancel()
+
 			if err != nil {
-				log.Printf("Failed to get latest block: %v", err)
+				log.Printf("Failed to get latest block during monitoring: %v", err)
+				// Force a reconnection attempt
+				client.ForceReconnectETH()
 				continue
 			}
 
