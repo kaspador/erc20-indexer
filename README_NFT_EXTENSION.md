@@ -133,3 +133,4 @@ The following indexes are automatically created for optimal performance:
 - `idx_nft_operator_approvals_block` - Fast lookups by block
 
 This extension makes the indexer a comprehensive solution for both ERC20 and NFT approval tracking on Kasplex!
+

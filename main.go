@@ -450,6 +450,87 @@ func (i *Indexer) getERC20TokenInfo(ethClient *ethclient.Client, address common.
 	return token, true
 }
 
+func (i *Indexer) isNFTContract(ethClient *ethclient.Client, address common.Address) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Check if it's already known as an ERC20 token
+	exists, err := database.TokenExists(address.Hex())
+	if err == nil && exists {
+		// It's a known ERC20 token, so it's not an NFT
+		return false
+	}
+
+	// Try to call ERC721-specific functions to determine if it's an NFT
+	// We'll try to call supportsInterface for ERC721 interface ID (0x80ac58cd)
+	erc721InterfaceID := [4]byte{0x80, 0xac, 0x58, 0xcd}
+	
+	// Create supportsInterface call data
+	// supportsInterface(bytes4) selector is 0x01ffc9a7
+	callData := make([]byte, 36)
+	copy(callData[0:4], []byte{0x01, 0xff, 0xc9, 0xa7}) // supportsInterface selector
+	copy(callData[4:8], erc721InterfaceID[:])           // ERC721 interface ID
+
+	msg := ethereum.CallMsg{
+		To:   &address,
+		Data: callData,
+	}
+
+	result, err := ethClient.CallContract(ctx, msg, nil)
+	if err != nil || len(result) < 32 {
+		// If supportsInterface fails, try other NFT-specific methods
+		return i.hasNFTMethods(ethClient, address)
+	}
+
+	// Check if the result indicates ERC721 support
+	// Result should be a boolean (true = supports ERC721)
+	if len(result) >= 32 && result[31] == 1 {
+		return true
+	}
+
+	// Fallback to checking for NFT-specific methods
+	return i.hasNFTMethods(ethClient, address)
+}
+
+func (i *Indexer) hasNFTMethods(ethClient *ethclient.Client, address common.Address) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Try to call tokenURI function which is specific to NFTs
+	// tokenURI(uint256) selector is 0xc87b56dd
+	callData := make([]byte, 36)
+	copy(callData[0:4], []byte{0xc8, 0x7b, 0x56, 0xdd}) // tokenURI selector
+	// Use token ID 1 as test
+	copy(callData[4:36], make([]byte, 32)) // token ID 1 (padded to 32 bytes)
+	callData[35] = 1
+
+	msg := ethereum.CallMsg{
+		To:   &address,
+		Data: callData,
+	}
+
+	_, err := ethClient.CallContract(ctx, msg, nil)
+	if err == nil {
+		// tokenURI call succeeded, likely an NFT
+		return true
+	}
+
+	// Try ownerOf function which is also specific to NFTs
+	// ownerOf(uint256) selector is 0x6352211e
+	callData2 := make([]byte, 36)
+	copy(callData2[0:4], []byte{0x63, 0x52, 0x21, 0x1e}) // ownerOf selector
+	copy(callData2[4:36], make([]byte, 32))               // token ID 1 (padded to 32 bytes)
+	callData2[35] = 1
+
+	msg2 := ethereum.CallMsg{
+		To:   &address,
+		Data: callData2,
+	}
+
+	_, err = ethClient.CallContract(ctx, msg2, nil)
+	return err == nil // If ownerOf succeeds, it's likely an NFT
+}
+
 func (i *Indexer) monitorNewBlocks() {
 	log.Println("Started to monitor new blocks...")
 	ticker := time.NewTicker(12 * time.Second)
@@ -510,19 +591,27 @@ func (i *Indexer) processNFTEvents(ethClient *ethclient.Client, blockNumber uint
 	for _, vLog := range logs {
 		if len(vLog.Topics) >= 3 {
 			if vLog.Topics[0] == nftApprovalEventSignature {
-				// Handle individual NFT approval
-				if err := i.processNFTApproval(vLog, blockNumber, blockHash); err != nil {
-					log.Printf("Error processing NFT approval in tx %s: %v", vLog.TxHash.Hex(), err)
-					continue
+				// Check if this is actually an NFT contract before processing as NFT approval
+				if i.isNFTContract(ethClient, vLog.Address) {
+					// Handle individual NFT approval
+					if err := i.processNFTApproval(vLog, blockNumber, blockHash); err != nil {
+						log.Printf("Error processing NFT approval in tx %s: %v", vLog.TxHash.Hex(), err)
+						continue
+					}
+					nftEventCount++
 				}
-				nftEventCount++
+				// If it's not an NFT contract, skip processing as NFT (it's likely ERC20)
 			} else if vLog.Topics[0] == nftApprovalForAllEventSignature {
-				// Handle operator approval (setApprovalForAll)
-				if err := i.processNFTOperatorApproval(vLog, blockNumber, blockHash); err != nil {
-					log.Printf("Error processing NFT operator approval in tx %s: %v", vLog.TxHash.Hex(), err)
-					continue
+				// ApprovalForAll is specific to NFTs, so we can process it directly
+				// But let's still verify it's an NFT contract for safety
+				if i.isNFTContract(ethClient, vLog.Address) {
+					// Handle operator approval (setApprovalForAll)
+					if err := i.processNFTOperatorApproval(vLog, blockNumber, blockHash); err != nil {
+						log.Printf("Error processing NFT operator approval in tx %s: %v", vLog.TxHash.Hex(), err)
+						continue
+					}
+					nftEventCount++
 				}
-				nftEventCount++
 			}
 		}
 	}
